@@ -1,5 +1,5 @@
-#ifndef _THREAD_POOL_
-#define _THREAD_POOL_
+#ifndef _THREADPOOL_
+#define _THREADPOOL_
 
 #ifdef __cplusplus
 extern "C" {
@@ -7,11 +7,14 @@ extern "C" {
 
 typedef void (*CALLBACK_PF)(void*);
 
-void* Pool_Init(int num_threads);
-int Pool_AddTask(void* p, CALLBACK_PF cb, void* arg);
-void Pool_Wait(void* p);
-void Pool_Destroy(void* p);
-int Pool_GetNumWorkingThread(void* p);
+
+void* Pool_Create(int iID, int iNumThreads);
+int   Pool_AddTask(void* pPool, CALLBACK_PF pfCallBack, void* pArg);
+void  Pool_Wait(void* pPool);
+void  Pool_Pause(void* pPool);
+void  Pool_Resume(void* pPool);
+void  Pool_Destroy(void* pPool);
+int   Pool_GetNumWorkingThreads(void* pPool);
 
 
 #ifdef __cplusplus
