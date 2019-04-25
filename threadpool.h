@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-typedef void (*CALLBACK_PF)(void*);
+typedef int (*CALLBACK_PF)(void*);
 
 
 void* Pool_Create(int iID, int iNumThreads);
@@ -15,6 +15,7 @@ void  Pool_Pause(void* pPool);
 void  Pool_Resume(void* pPool);
 void  Pool_Destroy(void* pPool);
 int   Pool_GetNumWorkingThreads(void* pPool);
+int   Pool_GetNumAliveThreads(void* pPool);
 
 
 #ifdef __cplusplus

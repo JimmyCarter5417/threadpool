@@ -1,23 +1,44 @@
 #include <unistd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <pthread.h>
+#include <string.h>
 #include <errno.h>
+#include <assert.h>
 #include <time.h>
 #include <sys/prctl.h>
 #include "threadpool.h"
 
 
-#ifdef DEBUG
-    #define error(str) fprintf(stderr, str)
-#else
-    #define error(str)
-#endif
-
 
 #define ERROR_SUCCESS  0
 #define ERROR_FAILED  -1
+
+/* 前置声明 */
+typedef struct MYCOND MYCOND_S;
+typedef struct TASK TASK_S;
+typedef struct QUEUE QUEUE_S;
+typedef struct THREAD THREAD_S;
+typedef struct POOL POOL_S;
+
+static int _Thread_Create(POOL_S* pstPool, THREAD_S** ppstThread, int iID);
+static void* _Thread_CallBack(void* pArg);
+static void _Thread_Signal(int iSignal);
+static void _Thread_Destroy(THREAD_S* pstThread);
+static int _Queue_Init(QUEUE_S* pstQueue);
+static void _Queue_Push(QUEUE_S* pstQueue, TASK_S* pstTask);
+static TASK_S* _Queue_Pull(QUEUE_S* pstQueue);
+static void _Queue_Destroy(QUEUE_S* pstQueue);
+static void _Mycond_Init(MYCOND_S *pstMycond);
+static void _Mycond_Destroy(MYCOND_S *pstMycond);
+static void _Mycond_Signal(MYCOND_S *pstMycond);
+static void _Mycond_Broadcast(MYCOND_S *pstMycond);
+static void _Mycond_Wait(MYCOND_S* pstMycond);
+
+
 
 
 /* 条件变量 */
@@ -31,7 +52,7 @@ typedef struct MYCOND
 /* 任务 */
 typedef struct TASK
 {
-    TASK*        pstNext;
+    TASK_S*      pstNext;
     CALLBACK_PF  pfCallBack;
     void*        pArg;
 }TASK_S;
@@ -52,6 +73,7 @@ typedef struct THREAD
     int        iID;
     pthread_t  stID;
     POOL_S*    pstPool;
+}THREAD_S;
 
 /* 线程池 */
 typedef struct POOL
@@ -63,19 +85,37 @@ typedef struct POOL
     int              iID;
     bool             bIsRunning;
     bool             bIsPausing;
-    volatile int     iNumThreadsAlive;      /* 当前存活的线程数         */
-    volatile int     iNumThreadsWorking;    /* 当前工作的线程数 */
+    volatile int     iNumAliveThreads;      /* 当前存活的线程数         */
+    volatile int     iNumWorkingThreads;    /* 当前工作的线程数 */
 }POOL_S;
 
 
-static int _Thread_Create(POOL_S* pstPool, struct THREAD_S** ppstThread, int iID)
+
+
+void dbg(char* szFmt, ...)
+{
+    if(NULL != szFmt)
+    {
+        char szBuf[1024] = {0};
+        va_list va;
+        va_start(va, szFmt);
+        vsnprintf(szBuf, sizeof(szBuf), szFmt, va);
+        va_end(va);
+        fputs(szBuf, stdout);
+    }
+
+    return;
+}
+
+
+static int _Thread_Create(POOL_S* pstPool, THREAD_S** ppstThread, int iID)
 {
     int iRet = ERROR_SUCCESS;
     
     *ppstThread = (THREAD_S*)malloc(sizeof(THREAD_S));
     if (NULL == ppstThread)
     {
-        error("_Thread_Create: malloc failed for a new thread %d\n", iID);
+        dbg("_Thread_Create: malloc failed for a new thread %d\n", iID);
         return ERROR_FAILED;
     }
 
@@ -87,12 +127,99 @@ static int _Thread_Create(POOL_S* pstPool, struct THREAD_S** ppstThread, int iID
     
     if (ERROR_SUCCESS != iRet)
     {
-        error("pthread_create failed: iRet = %d\n", iRet);
+        dbg("pthread_create failed: iRet = %d\n", iRet);
     }
     
     return iRet;
 }
 
+/* 线程回调函数 */
+static void* _Thread_CallBack(void* pArg)
+{
+    if (NULL == pArg)
+    {
+        dbg("_Thread_CallBack: NULL pArg\n");
+        return NULL;
+    }
+    
+    THREAD_S* pstThread = (THREAD_S*)pArg;
+    POOL_S*   pstPool   = pstThread->pstPool;
+    
+    /* 设置线程名字 */
+    char szThreadName[16] = {0}; /* 最多16个字节 */
+    snprintf(szThreadName, 
+             sizeof(szThreadName), 
+             "p-%d-t-%d", 
+             pstPool->iID,
+             pstThread->iID);
+    prctl(PR_SET_NAME, szThreadName);
+
+    /* 设置SIGUSR1/SIGUSR2的信号处理函数 */
+    struct sigaction stSa;
+    sigemptyset(&stSa.sa_mask);
+    stSa.sa_flags   = SA_RESTART; /* 自动重启被中断的系统调用 */
+    stSa.sa_handler = _Thread_Signal;
+    if (-1 == sigaction(SIGUSR1, &stSa, NULL))
+    {
+        dbg("_Thread_CallBack: failed to set SIGUSR1\n");
+    }
+    if (-1 == sigaction(SIGUSR2, &stSa, NULL))
+    {
+        dbg("_Thread_CallBack: failed to set SIGUSR2\n");
+    }
+
+    /* 线程已启动，将存活线程计数加一 */
+    pthread_mutex_lock(&pstPool->stLock);
+    pstPool->iNumAliveThreads++;
+    pthread_mutex_unlock(&pstPool->stLock);
+
+    while(pstPool->bIsRunning)
+    {
+        /* 在工作队列等待任务 */
+        _Mycond_Wait(&pstPool->stQueue.stNotEmpty);
+        /* 如果用户已经终止了线程池，就不处理任务了 */
+        if (!pstPool->bIsRunning)
+        {
+            break;
+        }
+
+        /* 线程开始干活了，增加工作线程计数 */
+        pthread_mutex_lock(&pstPool->stLock);
+        pstPool->iNumWorkingThreads++;
+        pthread_mutex_unlock(&pstPool->stLock);
+
+        /* todo:增加批量处理功能 */
+        TASK_S* pstTask = _Queue_Pull(&pstPool->stQueue);
+        if (pstTask) 
+        {
+            CALLBACK_PF pfCB = pstTask->pfCallBack;
+            void*      *pArg = pstTask->pArg;
+            
+            if (NULL != pfCB)
+            {
+                (void)pfCB(pArg);
+            }
+
+            /* todo：待完善 */
+            free(pstTask); /* 释放task资源 */
+        }
+
+        /* 处理完任务后，线程空闲，工作线程计数减一 */
+        pthread_mutex_lock(&pstPool->stLock);
+        if (0 == --pstPool->iNumWorkingThreads) /* 所有线程都空闲，可发射信号量 */
+        {
+            pthread_cond_signal(&pstPool->stAllIdle);
+        }
+        pthread_mutex_unlock(&pstPool->stLock);
+    }
+
+    /* 线程已结束，将存活线程计数减一 */
+    pthread_mutex_lock(&pstPool->stLock);
+    pstPool->iNumAliveThreads --;
+    pthread_mutex_unlock(&pstPool->stLock);
+
+    return NULL;
+}
 
 /* 线程信号处理函数 */
 static void _Thread_Signal(int iSignal) 
@@ -115,95 +242,6 @@ static void _Thread_Signal(int iSignal)
 
     return;
 }
-
-/* 线程回调函数 */
-static void* _Thread_CallBack(void* pArg)
-{
-    if (NULL == pArg)
-    {
-        error("_Thread_CallBack: NULL pArg\n");
-        return NULL;
-    }
-    
-    THREAD_S* pstThread = (THREAD_S*)pArg;
-    POOL_S*   pstPool   = pstThread->pstPool;
-    
-    /* 设置线程名字 */
-    char szThreadName[128] = {0};
-    snprintf(szThreadName, 
-             sizeof(szThreadName), 
-             "pool-%d-thread-%d", 
-             pstPool->iID,
-             pstThread->iID);
-    prctl(PR_SET_NAME, szThreadName);
-
-    /* 设置SIGUSR1/SIGUSR2的信号处理函数 */
-    struct sigaction stSa;
-    sigemptyset(&stSa.sa_mask);
-    stSa.sa_flags   = SA_RESTART; /* 自动重启被中断的系统调用 */
-    stSa.sa_handler = _Thread_Signal;
-    if (-1 == sigaction(SIGUSR1, &stSa, NULL))
-    {
-        error("_Thread_CallBack: failed to set SIGUSR1\n");
-    }
-    if (-1 == sigaction(SIGUSR2, &stSa, NULL))
-    {
-        error("_Thread_CallBack: failed to set SIGUSR2\n");
-    }
-
-    /* 线程已启动，将存活线程计数加一 */
-    pthread_mutex_lock(&pstPool->stLock);
-    pstPool->iNumThreadsAlive++;
-    pthread_mutex_unlock(&pstPool->stLock);
-
-    while(pstPool->bIsRunning)
-    {
-        /* 在工作队列等待任务 */
-        _Mycond_Wait(&pstPool->stQueue.stNotEmpty);
-        /* 如果用户已经终止了线程池，就不处理任务了 */
-        if (!pstPool->bIsRunning)
-        {
-            break;
-        }
-
-        /* 线程开始干活了，增加工作线程计数 */
-        pthread_mutex_lock(&pstPool->stLock);
-        pstPool->iNumThreadsWorking++;
-        pthread_mutex_unlock(&pstPool->stLock);
-
-        /* todo:增加批量处理功能 */
-        TASK_S* pstTask = _Queue_Pull(&pstPool->stQueue);
-        if (pstTask) 
-        {
-            CALLBACK_PF pfCB = pstTask->pfCallBack;
-            void*      *pArg = pstTask->pArg;
-            
-            if (NULL != pfCB);
-            {
-                (void)pfCB(pArg);
-            }
-
-            /* todo：待完善 */
-            free(pstTask); /* 释放task资源 */
-        }
-
-        /* 处理完任务后，线程空闲，工作线程计数减一 */
-        pthread_mutex_lock(&pstPool->stLock);
-        if (0 == --pstPool->iNumThreadsWorking) /* 所有线程都空闲，可发射信号量 */
-        {
-            pthread_cond_signal(&pstPool->stAllIdle);
-        }
-        pthread_mutex_unlock(&pstPool->stLock);
-    }
-
-    /* 线程已结束，将存活线程计数减一 */
-    pthread_mutex_lock(&pstPool->stLock);
-    pstPool->iNumThreadsAlive --;
-    pthread_mutex_unlock(&pstPool->stLock);
-
-    return NULL;
-}
-
 
 /* 销毁线程 */
 static void _Thread_Destroy(THREAD_S* pstThread)
@@ -252,7 +290,7 @@ static void _Queue_Push(QUEUE_S* pstQueue, TASK_S* pstTask)
     pstTask->pstNext = NULL;
     pstQueue->iLen++;
 
-    _Mycond_Signal(pstQueue->stNotEmpty); /* 发射信号 */
+    _Mycond_Signal(&pstQueue->stNotEmpty); /* 发射信号 */
     
     pthread_mutex_unlock(&pstQueue->stLock);
 
@@ -280,7 +318,7 @@ static TASK_S* _Queue_Pull(QUEUE_S* pstQueue)
         pstQueue->pstHead = pstTask->pstNext; /* 摘掉头结点 */
         pstQueue->iLen--;
 
-        _Mycond_Signal(pstQueue->stNotEmpty); /* 工作队列非空，需要发射信号 */
+        _Mycond_Signal(&pstQueue->stNotEmpty); /* 工作队列非空，需要发射信号 */
     }
     /* 不会出现长度为0的情况 */
 
@@ -381,20 +419,20 @@ static void _Mycond_Wait(MYCOND_S* pstMycond)
 
 
 /* Initialise thread pool */
-struct void* Pool_Create(int iID, int iNumThreads)
+void* Pool_Create(int iID, int iNumThreads)
 {
     if (iNumThreads <= 0)
     {
-        error("Pool_Create: invalid param, iNumThreads=%d\n", iNumThreads);
+        dbg("Pool_Create: invalid param, iNumThreads=%d\n", iNumThreads);
 
         return NULL;
     }
 
     /* 创建线程池 */
     POOL_S* pstPool = (POOL_S*)malloc(sizeof(POOL_S));
-    if (NULL != pstPool)
+    if (NULL == pstPool)
     {
-        error("Pool_Create: Could not allocate memory for thread pool\n");
+        dbg("Pool_Create: Could not allocate memory for thread pool\n");
         
         return NULL;
     }
@@ -404,7 +442,7 @@ struct void* Pool_Create(int iID, int iNumThreads)
     /* 创建工作队列 */
     if (ERROR_SUCCESS != _Queue_Init(&pstPool->stQueue))
     {
-        error("Pool_Create: Could not allocate memory for task queue\n");
+        dbg("Pool_Create: Could not allocate memory for task queue\n");
         
         free(pstPool);
         
@@ -415,7 +453,7 @@ struct void* Pool_Create(int iID, int iNumThreads)
     pstPool->ppstThreads = (THREAD_S**)malloc(iNumThreads * sizeof(THREAD_S *));
     if (NULL == pstPool->ppstThreads)
     {
-        error("Pool_Create: Could not allocate memory for threads\n");
+        dbg("Pool_Create: Could not allocate memory for threads\n");
 
         free(pstPool);
         _Queue_Destroy(&pstPool->stQueue);
@@ -427,10 +465,10 @@ struct void* Pool_Create(int iID, int iNumThreads)
     pthread_mutex_init(&pstPool->stLock, NULL);
     pthread_cond_init(&pstPool->stAllIdle, NULL);
     pstPool->iID = iID;
-    pstPool->iNumThreadsAlive   = 0;
-    pstPool->iNumThreadsWorking = 0;
+    pstPool->iNumAliveThreads   = 0;
+    pstPool->iNumWorkingThreads = 0;
     pstPool->bIsPausing = false;
-    pstPool->bIsRunning = false;
+    pstPool->bIsRunning = true; /* 开始必须设为true */
 
     /* 创建所有线程 */
     int i;
@@ -438,19 +476,17 @@ struct void* Pool_Create(int iID, int iNumThreads)
     {
         if (ERROR_SUCCESS != _Thread_Create(pstPool, &pstPool->ppstThreads[i], i))
         {
-            error("Pool_Create: failed to _Thread_Create for i=%d\n", i);
+            dbg("Pool_Create: failed to _Thread_Create for i=%d\n", i);
         }
     }
 
     /* 等待所有线程启动然后进入等待状态，先简单用个循环处理一下 */
-    while (pstPool->iNumThreadsAlive != iNumThreads) 
+    while (pstPool->iNumAliveThreads != iNumThreads) 
     {
 
     }
     
     /* 搞起 */
-    pstPool->bIsRunning = true;
-
     return (void*)pstPool;
 }
 
@@ -459,9 +495,9 @@ int Pool_AddTask(void* pPool, CALLBACK_PF pfCallBack, void* pArg)
 {
     if ((NULL == pPool) || (NULL == pfCallBack))
     {
-        error("Pool_AddTask: invalid param: pPool=%p, pfCallBack=%p\n", 
-            pPool, 
-            pfCallBack);
+        dbg("Pool_AddTask: invalid param: pPool=%p, pfCallBack=%p\n", 
+              pPool, 
+              pfCallBack);
 
         return ERROR_FAILED;
     }
@@ -470,7 +506,7 @@ int Pool_AddTask(void* pPool, CALLBACK_PF pfCallBack, void* pArg)
     TASK_S* pstTask = (TASK_S*)malloc(sizeof(TASK_S));
     if (NULL == pstTask)
     {
-        error("Pool_AddTask: Could not allocate memory for new job\n");
+        dbg("Pool_AddTask: Could not allocate memory for new job\n");
         
         return ERROR_FAILED;
     }
@@ -493,7 +529,7 @@ void Pool_Wait(void* pPool)
 {
     if (NULL == pPool)
     {
-        error("Pool_Wait: NULL pPool\n");
+        dbg("Pool_Wait: NULL pPool\n");
 
         return ;
     }
@@ -502,7 +538,7 @@ void Pool_Wait(void* pPool)
 
     /* 等待停止 */
     pthread_mutex_lock(&pstPool->stLock);
-    while (pstPool->stQueue.iLen || pstPool->iNumThreadsWorking) // todo:这里有问题
+    while (pstPool->stQueue.iLen || pstPool->iNumWorkingThreads) // todo:这里有问题
     {
         pthread_cond_wait(&pstPool->stAllIdle, &pstPool->stLock);
     }
@@ -517,20 +553,20 @@ void Pool_Destroy(void* pPool)
 {
     if (NULL == pPool)
     {
-        error("Pool_Destroy: NULL pPool\n");
+        dbg("Pool_Destroy: NULL pPool\n");
         return;
     }
 
     POOL_S*      pstPool     = (POOL_S*)pPool;
-    volatile int iNumThreads = pstPool->iNumThreadsAlive; /* 先保存线程数目 */
+    volatile int iNumThreads = pstPool->iNumAliveThreads; /* 先保存线程数目 */
 
     pstPool->bIsRunning = false; /* 终止线程回调函数循环 */
 
     /* 先简单处理，广播后等一秒 */
     /* todo：待优化 */
-    while (pstPool->iNumThreadsAlive)
+    while (pstPool->iNumAliveThreads)
     {
-        _Mycond_Broadcast(pstPool->stQueue.stNotEmpty);
+        _Mycond_Broadcast(&pstPool->stQueue.stNotEmpty);
         sleep(1);
     }
 
@@ -555,14 +591,14 @@ void Pool_Pause(void* pPool)
 {    
     if (NULL == pPool)
     {
-        error("Pool_Pause: NULL pPool\n");
+        dbg("Pool_Pause: NULL pPool\n");
         return ;
     }
     
     POOL_S* pstPool = (POOL_S*)pPool;
 
     int i;
-    for(i = 0; i < pstPool->iNumThreadsAlive; i++)
+    for(i = 0; i < pstPool->iNumAliveThreads; i++)
     {
         /* 向所有线程发送SIGUSR1信号 */
         pthread_kill(pstPool->ppstThreads[i]->stID, SIGUSR1);
@@ -577,14 +613,14 @@ void Pool_Resume(void* pPool)
 {
     if (NULL == pPool)
     {
-        error("Pool_Pause: NULL pPool\n");
+        dbg("Pool_Pause: NULL pPool\n");
         return ;
     }
     
     POOL_S* pstPool = (POOL_S*)pPool;
 
     int i;
-    for(i = 0; i < pstPool->iNumThreadsAlive; i++)
+    for(i = 0; i < pstPool->iNumAliveThreads; i++)
     {
         /* 向所有线程发送SIGUSR2信号 */
         pthread_kill(pstPool->ppstThreads[i]->stID, SIGUSR2);
@@ -597,12 +633,26 @@ int Pool_GetNumWorkingThreads(void* pPool)
 {
     if (NULL == pPool)
     {
-        error("Pool_GetNumWorkingThread: NULL pPool\n");
-        return ;
+        dbg("Pool_GetNumWorkingThread: NULL pPool\n");
+        return -1;
     }
 
     POOL_S* pstPool = (POOL_S*)pPool;
 
-    return pstPool->iNumThreadsWorking;
+    return pstPool->iNumWorkingThreads;
 }
+
+int Pool_GetNumAliveThreads(void* pPool)
+{
+    if (NULL == pPool)
+    {
+        dbg("Pool_GetNumWorkingThread: NULL pPool\n");
+        return -1;
+    }
+
+    POOL_S* pstPool = (POOL_S*)pPool;
+
+    return pstPool->iNumAliveThreads;
+}
+
 
