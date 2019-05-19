@@ -559,15 +559,18 @@ void Pool_Destroy(void* pPool)
 
     POOL_S*      pstPool     = (POOL_S*)pPool;
     volatile int iNumThreads = pstPool->iNumAliveThreads; /* 先保存线程数目 */
+    struct timeval tv;
 
     pstPool->bIsRunning = false; /* 终止线程回调函数循环 */
+    tv.tv_sec  = 0;
+    tv.tv_usec = 1;
 
-    /* 先简单处理，广播后等一秒 */
-    /* todo：待优化 */
+    /* 先简单处理，广播后等1us */
     while (pstPool->iNumAliveThreads)
     {
         _Mycond_Broadcast(&pstPool->stQueue.stNotEmpty);
-        sleep(1);
+
+        select(0, NULL, NULL, NULL, &tv); 
     }
 
     /* 销毁工作队列 */
