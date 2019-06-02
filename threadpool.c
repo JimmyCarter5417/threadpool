@@ -64,7 +64,7 @@ typedef struct QUEUE
     TASK_S         *pstHead;            
     TASK_S         *pstTail;            
     MYCOND_S        stNotEmpty;         /* 用于通知线程队列非空 */
-    int             iLen;               /* 工作队列长度       */
+    int             iLen;               /* 工作队列长度         */
 }QUEUE_S;
 
 /* 线程 */
@@ -78,14 +78,14 @@ typedef struct THREAD
 /* 线程池 */
 typedef struct POOL
 {
-    THREAD_S**       ppstThreads;           /* 动态创建所有线程        */
+    THREAD_S**       ppstThreads;           /* 动态创建所有线程       */
     QUEUE_S          stQueue;               /* 没必要动态创建任务队列 */
-    pthread_mutex_t  stLock;                /* 用于同步各个计数 */
-    pthread_cond_t   stAllIdle;             /* 用于通知线程池空闲 */
+    pthread_mutex_t  stLock;                /* 用于同步各个计数       */
+    pthread_cond_t   stAllIdle;             /* 用于通知线程池空闲     */
     int              iID;
     bool             bIsRunning;
     bool             bIsPausing;
-    volatile int     iNumAliveThreads;      /* 当前存活的线程数         */
+    volatile int     iNumAliveThreads;      /* 当前存活的线程数 */
     volatile int     iNumWorkingThreads;    /* 当前工作的线程数 */
 }POOL_S;
 
@@ -632,6 +632,7 @@ void Pool_Resume(void* pPool)
     return;
 }
 
+/* 获取正在工作的线程数目 */
 int Pool_GetNumWorkingThreads(void* pPool)
 {
     if (NULL == pPool)
@@ -645,6 +646,7 @@ int Pool_GetNumWorkingThreads(void* pPool)
     return pstPool->iNumWorkingThreads;
 }
 
+/* 获取存活的线程数目 */
 int Pool_GetNumAliveThreads(void* pPool)
 {
     if (NULL == pPool)
