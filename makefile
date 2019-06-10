@@ -1,12 +1,21 @@
-CC     = gcc
-CFLAGS = -Wall -Wextra -g -O0
-LIBS   = -lpthread
-SRC    = *.c
-TARGET = test
+CC        = gcc
+INCLUDE   = 
+LINKPARAM = -lpthread
+CFLAGS    = -Wall -Wextra -g -O0
+SRC       = $(wildcard *.c)
+OBJ       = $(SRC:.c=.o)
+PROGRAM   = test
 
-all : $(SRC)
-	$(CC) $(SRC) $(CFLAGS) $(LIBS) -o $(TARGET)
-clean : 
-	rm -f $(TARGET)
+all: clean $(PROGRAM)
 
-.PHONY: clean
+$(PROGRAM): $(OBJ)
+	$(CC) $(OBJ) $(LINKPARAM) -o $@
+
+clean :
+	rm -f *.o
+	rm -f $(PROGRAM)
+    
+%.o : %.c
+	$(CC) $(INCLUDE) $(CFLAGS) -c $< -o $@
+
+.PHONY : clean
